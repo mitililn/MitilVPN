@@ -1,7 +1,7 @@
 import re
 import base64
 import json
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import os
 import time
@@ -33,7 +33,8 @@ def get_country_by_ip(ip):
     return "XX"  # Неизвестная страна
 
 def extract_links(content):
-    pattern = r'(?:vmess|trojan|vless|ss)://[^\s]+'
+    # Добавлены wireguard и hysteria2 протоколы
+    pattern = r'(?:vmess|trojan|vless|ss|wireguard|hysteria2)://[^\s]+'
     return re.findall(pattern, content)
 
 def read_existing_links(filename):
@@ -62,6 +63,99 @@ def parse_vmess(link):
         return config.get('add'), config.get('port'), config
     except:
         return None, None, None
+
+def parse_wireguard(link):
+    """Парсит WireGuard ссылки"""
+    try:
+        # WireGuard ссылки обычно имеют формат wireguard://config_base64?name=...
+        # или wireguard://endpoint:port?publickey=...&privatekey=...&name=...
+        parsed = urlparse(link)
+        
+        # Если это base64 конфиг
+        if not parsed.netloc:
+            # Пытаемся декодировать как base64
+            try:
+                config_data = parsed.path
+                missing_padding = len(config_data) % 4
+                if missing_padding:
+                    config_data += '=' * (4 - missing_padding)
+                decoded = base64.b64decode(config_data).decode('utf-8')
+                
+                # Ищем Endpoint в конфиге
+                endpoint_match = re.search(r'Endpoint\s*=\s*([^:\s]+):(\d+)', decoded, re.IGNORECASE)
+                if endpoint_match:
+                    host = endpoint_match.group(1)
+                    port = int(endpoint_match.group(2))
+                    return host, port, decoded
+            except:
+                pass
+        
+        # Если это URL с параметрами
+        if parsed.netloc:
+            host_port = parsed.netloc.split(':')
+            host = host_port[0]
+            port = int(host_port[1]) if len(host_port) > 1 else 51820  # стандартный порт WireGuard
+            return host, port, parsed
+        
+        # Пытаемся извлечь из query параметров
+        query_params = parse_qs(parsed.query)
+        if 'endpoint' in query_params:
+            endpoint = query_params['endpoint'][0]
+            if ':' in endpoint:
+                host, port = endpoint.rsplit(':', 1)
+                return host, int(port), parsed
+            else:
+                return endpoint, 51820, parsed
+                
+    except Exception as e:
+        print(f"Ошибка парсинга WireGuard: {str(e)}")
+    
+    return None, None, None
+
+def parse_hysteria2(link):
+    """Парсит Hysteria2 ссылки"""
+    try:
+        # Hysteria2 ссылки имеют формат hysteria2://password@host:port?param=value#name
+        parsed = urlparse(link)
+        
+        if parsed.hostname:
+            host = parsed.hostname
+            port = parsed.port if parsed.port else 443  # стандартный порт для Hysteria2
+            return host, port, parsed
+        
+        # Альтернативный парсинг если стандартный не работает
+        # Убираем протокол
+        content = link[11:]  # убираем 'hysteria2://'
+        
+        # Ищем @ для разделения пароля и хоста
+        if '@' in content:
+            _, host_part = content.split('@', 1)
+        else:
+            host_part = content
+        
+        # Убираем параметры и имя
+        if '?' in host_part:
+            host_part = host_part.split('?')[0]
+        if '#' in host_part:
+            host_part = host_part.split('#')[0]
+        
+        # Парсим host:port
+        if ':' in host_part:
+            host, port = host_part.rsplit(':', 1)
+            try:
+                port = int(port)
+            except:
+                port = 443
+        else:
+            host = host_part
+            port = 443
+            
+        return host, port, parsed
+        
+    except Exception as e:
+        print(f"Ошибка парсинга Hysteria2: {str(e)}")
+    
+    return None, None, None
 
 def parse_generic_url(link):
     """Обрабатывает ss, trojan и vless ссылки"""
@@ -107,21 +201,8 @@ def modify_link_with_country(link, country_code):
             new_b64 = base64.b64encode(new_config_str.encode('utf-8')).decode('utf-8')
             return f"vmess://{new_b64}"
             
-        elif protocol in ['trojan', 'vless']:
-            # Для trojan и vless изменяем fragment (имя после #)
-            if '#' in link:
-                base_link, current_name = link.rsplit('#', 1)
-                from urllib.parse import unquote, quote
-                current_name = unquote(current_name)
-                if not current_name.startswith(f"[{country_code}]"):
-                    new_name = f"[{country_code}] {current_name}".strip()
-                    return f"{base_link}#{quote(new_name)}"
-            else:
-                # Если нет имени, добавляем его
-                return f"{link}#{quote(f'[{country_code}] Server')}"
-                
-        elif protocol == 'ss':
-            # Для shadowsocks также работаем с fragment
+        elif protocol in ['trojan', 'vless', 'ss', 'hysteria2']:
+            # Для trojan, vless, ss и hysteria2 изменяем fragment (имя после #)
             if '#' in link:
                 base_link, current_name = link.rsplit('#', 1)
                 from urllib.parse import unquote, quote
@@ -134,76 +215,165 @@ def modify_link_with_country(link, country_code):
                 from urllib.parse import quote
                 return f"{link}#{quote(f'[{country_code}] Server')}"
                 
+        elif protocol == 'wireguard':
+            # Для WireGuard добавляем имя в query параметры или модифицируем существующее
+            from urllib.parse import parse_qs, urlencode, quote
+            
+            if '?' in link:
+                base_link, query_string = link.split('?', 1)
+                
+                # Парсим существующие параметры
+                if '#' in query_string:
+                    query_string, fragment = query_string.rsplit('#', 1)
+                    fragment = unquote(fragment)
+                    if not fragment.startswith(f"[{country_code}]"):
+                        fragment = f"[{country_code}] {fragment}".strip()
+                    return f"{base_link}?{query_string}#{quote(fragment)}"
+                else:
+                    # Добавляем name в query параметры
+                    params = parse_qs(query_string)
+                    if 'name' in params:
+                        current_name = params['name'][0]
+                        if not current_name.startswith(f"[{country_code}]"):
+                            params['name'] = [f"[{country_code}] {current_name}".strip()]
+                    else:
+                        params['name'] = [f"[{country_code}] WireGuard Server"]
+                    
+                    new_query = urlencode(params, doseq=True)
+                    return f"{base_link}?{new_query}"
+            else:
+                # Если нет параметров, добавляем name
+                from urllib.parse import quote
+                return f"{link}?name={quote(f'[{country_code}] WireGuard Server')}"
+                
     except Exception as e:
         print(f"Ошибка при модификации ссылки: {str(e)}")
     
     return link  # Возвращаем оригинальную ссылку в случае ошибки
 
-def check_connection_advanced(host, port, timeout=10):
-    """Улучшенная проверка соединения через HTTP запросы"""
-    if not host or not port:
-        return False
-    
+def check_tcp_connection_speed(host, port, timeout=5, test_size=1024):
+    """Проверяет TCP соединение и измеряет скорость"""
     try:
         port = int(port)
+        start_time = time.time()
         
-        # Проверяем через разные методы
-        test_urls = [
-            f"https://{host}:{port}",
-            f"http://{host}:{port}",
-            f"https://{host}" if port == 443 else None,
-            f"http://{host}" if port == 80 else None
-        ]
-        
-        # Убираем None значения
-        test_urls = [url for url in test_urls if url is not None]
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive'
-        }
-        
-        session = requests.Session()
-        session.headers.update(headers)
-        
-        for url in test_urls:
-            try:
-                # Проба HEAD запроса (быстрее)
-                response = session.head(url, timeout=timeout, verify=False, allow_redirects=True)
-                if response.status_code < 500:  # Любой код кроме серверных ошибок считаем успехом
-                    return True
-            except requests.exceptions.SSLError:
-                # Если SSL ошибка, пробуем GET запрос
-                try:
-                    response = session.get(url, timeout=timeout//2, verify=False, allow_redirects=True)
-                    if response.status_code < 500:
-                        return True
-                except:
-                    continue
-            except requests.exceptions.ConnectTimeout:
-                continue
-            except requests.exceptions.ConnectionError:
-                continue
-            except:
-                continue
-        
-        # Если HTTP не работает, пробуем простое TCP соединение
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(timeout//2)
-                result = s.connect_ex((host, port))
-                return result == 0
-        except:
-            pass
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
             
-        return False
-        
+            # Измеряем время подключения
+            connect_start = time.time()
+            result = s.connect_ex((host, port))
+            connect_time = (time.time() - connect_start) * 1000  # в миллисекундах
+            
+            if result == 0:
+                # Соединение успешно
+                try:
+                    # Пытаемся отправить небольшой объем данных для проверки скорости
+                    test_data = b'A' * min(test_size, 512)  # Уменьшенный размер для безопасности
+                    
+                    send_start = time.time()
+                    s.send(test_data)
+                    send_time = (time.time() - send_start) * 1000
+                    
+                    # Рассчитываем примерную скорость (очень приблизительно)
+                    if send_time > 0:
+                        speed_kbps = (len(test_data) * 8) / (send_time / 1000) / 1024
+                    else:
+                        speed_kbps = 0
+                    
+                    return True, connect_time, speed_kbps
+                    
+                except (socket.timeout, ConnectionResetError, BrokenPipeError):
+                    # Даже если отправка данных не удалась, соединение работает
+                    return True, connect_time, 0
+                except:
+                    return True, connect_time, 0
+            else:
+                return False, connect_time, 0
+                
     except Exception as e:
-        print(f"Error checking {host}:{port} - {str(e)}")
-        return False
+        return False, float('inf'), 0
+
+def check_connection_with_speed(host, port, timeout=10):
+    """Улучшенная проверка соединения с измерением скорости"""
+    if not host or not port:
+        return False, {}
+    
+    try:
+        # Основная проверка через TCP
+        is_connected, connect_time, speed = check_tcp_connection_speed(host, port, timeout//2)
+        
+        if is_connected:
+            # Дополнительные метрики
+            metrics = {
+                'connect_time_ms': round(connect_time, 2),
+                'speed_kbps': round(speed, 2) if speed > 0 else 0,
+                'connection_quality': 'excellent' if connect_time < 100 else 
+                                    'good' if connect_time < 300 else 
+                                    'average' if connect_time < 500 else 'poor'
+            }
+            
+            # Дополнительная проверка через HTTP для веб-серверов (опционально)
+            if port in [80, 443, 8080, 8443]:
+                try:
+                    protocol = 'https' if port in [443, 8443] else 'http'
+                    url = f"{protocol}://{host}:{port}"
+                    
+                    http_start = time.time()
+                    response = requests.head(url, timeout=timeout//3, verify=False)
+                    http_time = (time.time() - http_start) * 1000
+                    
+                    if response.status_code < 500:
+                        metrics['http_response_time_ms'] = round(http_time, 2)
+                        metrics['http_status'] = response.status_code
+                        
+                except:
+                    pass  # HTTP проверка опциональна
+            
+            return True, metrics
+        else:
+            return False, {'connect_time_ms': connect_time, 'error': 'connection_failed'}
+            
+    except Exception as e:
+        return False, {'error': str(e)}
+
+def ping_test(host, timeout=3):
+    """Простой ping тест для дополнительной проверки"""
+    try:
+        # Используем системную команду ping
+        import subprocess
+        import platform
+        
+        # Определяем параметры ping для разных ОС
+        if platform.system().lower() == 'windows':
+            cmd = ['ping', '-n', '1', '-w', str(timeout * 1000), host]
+        else:
+            cmd = ['ping', '-c', '1', '-W', str(timeout), host]
+        
+        start_time = time.time()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
+        ping_time = (time.time() - start_time) * 1000
+        
+        if result.returncode == 0:
+            # Извлекаем время ping из вывода
+            output = result.stdout
+            if platform.system().lower() == 'windows':
+                ping_match = re.search(r'время[<=]\s*(\d+)\s*мс', output, re.IGNORECASE)
+                if not ping_match:
+                    ping_match = re.search(r'time[<=]\s*(\d+)\s*ms', output, re.IGNORECASE)
+            else:
+                ping_match = re.search(r'time=(\d+\.?\d*)\s*ms', output)
+            
+            if ping_match:
+                actual_ping = float(ping_match.group(1))
+                return True, actual_ping
+            else:
+                return True, ping_time
+        
+        return False, ping_time
+        
+    except:
+        return False, float('inf')
 
 def resolve_hostname(hostname):
     """Резолвит hostname в IP адрес"""
@@ -213,18 +383,136 @@ def resolve_hostname(hostname):
     except:
         return None
 
+def parse_wireguard(link):
+    """Парсит WireGuard ссылки"""
+    try:
+        # WireGuard ссылки обычно имеют формат wireguard://config_base64?name=...
+        # или wireguard://endpoint:port?publickey=...&privatekey=...&name=...
+        parsed = urlparse(link)
+        
+        # Если это base64 конфиг
+        if not parsed.netloc:
+            # Пытаемся декодировать как base64
+            try:
+                config_data = parsed.path
+                missing_padding = len(config_data) % 4
+                if missing_padding:
+                    config_data += '=' * (4 - missing_padding)
+                decoded = base64.b64decode(config_data).decode('utf-8')
+                
+                # Ищем Endpoint в конфиге
+                endpoint_match = re.search(r'Endpoint\s*=\s*([^:\s]+):(\d+)', decoded, re.IGNORECASE)
+                if endpoint_match:
+                    host = endpoint_match.group(1)
+                    port = int(endpoint_match.group(2))
+                    return host, port, decoded
+            except:
+                pass
+        
+        # Если это URL с параметрами
+        if parsed.netloc:
+            host_port = parsed.netloc.split(':')
+            host = host_port[0]
+            port = int(host_port[1]) if len(host_port) > 1 else 51820  # стандартный порт WireGuard
+            return host, port, parsed
+        
+        # Пытаемся извлечь из query параметров
+        query_params = parse_qs(parsed.query)
+        if 'endpoint' in query_params:
+            endpoint = query_params['endpoint'][0]
+            if ':' in endpoint:
+                host, port = endpoint.rsplit(':', 1)
+                return host, int(port), parsed
+            else:
+                return endpoint, 51820, parsed
+                
+    except Exception as e:
+        print(f"Ошибка парсинга WireGuard: {str(e)}")
+    
+    return None, None, None
+
+def parse_hysteria2(link):
+    """Парсит Hysteria2 ссылки"""
+    try:
+        # Hysteria2 ссылки имеют формат hysteria2://password@host:port?param=value#name
+        parsed = urlparse(link)
+        
+        if parsed.hostname:
+            host = parsed.hostname
+            port = parsed.port if parsed.port else 443  # стандартный порт для Hysteria2
+            return host, port, parsed
+        
+        # Альтернативный парсинг если стандартный не работает
+        # Убираем протокол
+        content = link[11:]  # убираем 'hysteria2://'
+        
+        # Ищем @ для разделения пароля и хоста
+        if '@' in content:
+            _, host_part = content.split('@', 1)
+        else:
+            host_part = content
+        
+        # Убираем параметры и имя
+        if '?' in host_part:
+            host_part = host_part.split('?')[0]
+        if '#' in host_part:
+            host_part = host_part.split('#')[0]
+        
+        # Парсим host:port
+        if ':' in host_part:
+            host, port = host_part.rsplit(':', 1)
+            try:
+                port = int(port)
+            except:
+                port = 443
+        else:
+            host = host_part
+            port = 443
+            
+        return host, port, parsed
+        
+    except Exception as e:
+        print(f"Ошибка парсинга Hysteria2: {str(e)}")
+    
+    return None, None, None
+
+def parse_generic_url(link):
+    """Обрабатывает ss, trojan и vless ссылки"""
+    try:
+        parsed = urlparse(link)
+        host = parsed.hostname
+        port = parsed.port
+        
+        # Установка портов по умолчанию для разных протоколов
+        if not port:
+            if parsed.scheme == "trojan":
+                port = 443
+            elif parsed.scheme == "ss":
+                port = 8388  # стандартный порт Shadowsocks
+            else:  # vless и другие
+                port = 443
+                
+        return host, port, parsed
+    except:
+        return None, None, None
+
 def check_link_wrapper(link):
-    """Обертка для проверки ссылки с определением страны"""
+    """Обертка для проверки ссылки с определением страны и скорости"""
     protocol = link.split('://')[0].lower()
     host, port = None, None
     
+    # Парсим ссылку в зависимости от протокола
     if protocol == 'vmess':
         host, port, config = parse_vmess(link)
+    elif protocol == 'wireguard':
+        host, port, config = parse_wireguard(link)
+    elif protocol == 'hysteria2':
+        host, port, config = parse_hysteria2(link)
     elif protocol in ['trojan', 'vless', 'ss']:
         host, port, parsed = parse_generic_url(link)
     
-    # Проверяем соединение
-    is_working = check_connection_advanced(host, port)
+    # Проверяем соединение и скорость
+    is_working, metrics = check_connection_with_speed(host, port)
     
     if is_working:
         # Определяем IP адрес
@@ -238,6 +526,11 @@ def check_link_wrapper(link):
             country_code = get_country_by_ip(ip)
         elif ip:  # host является IP адресом
             country_code = get_country_by_ip(ip)
+        
+        # Ping тест для дополнительной информации
+        ping_success, ping_ms = ping_test(host)
+        if ping_success:
+            metrics['ping_ms'] = round(ping_ms, 2)
             
         # Ограничиваем количество запросов к API (небольшая задержка)
         time.sleep(0.1)
@@ -245,10 +538,17 @@ def check_link_wrapper(link):
         # Модифицируем ссылку с добавлением страны
         modified_link = modify_link_with_country(link, country_code)
         
-        print(f"✅ Working [{country_code}]: {protocol}://{host}:{port}")
+        # Расширенный вывод с метриками
+        speed_info = f" | Speed: {metrics.get('speed_kbps', 0):.1f} KB/s" if metrics.get('speed_kbps', 0) > 0 else ""
+        ping_info = f" | Ping: {metrics.get('ping_ms', 0):.1f}ms" if metrics.get('ping_ms', 0) > 0 else ""
+        connect_info = f" | Connect: {metrics.get('connect_time_ms', 0):.1f}ms"
+        quality_info = f" | Quality: {metrics.get('connection_quality', 'unknown')}"
+        
+        print(f"✅ Working [{country_code}]: {protocol}://{host}:{port}{connect_info}{ping_info}{speed_info}{quality_info}")
         return modified_link
     else:
-        print(f"❌ Not working: {protocol}://{host}:{port}")
+        error_info = f" | Error: {metrics.get('error', 'unknown')}" if 'error' in metrics else ""
+        print(f"❌ Not working: {protocol}://{host}:{port}{error_info}")
         return None
 
 def main():

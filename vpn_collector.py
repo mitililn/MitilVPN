@@ -4,14 +4,17 @@ import json
 import os
 import time
 import socket
+import ssl
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Попытка импорта requests и telethon
+# Попытка импорта библиотек
 try:
     import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 except ImportError:
-    print("❌ Ошибка: Модуль 'requests' не найден. Установите: pip install requests")
+    print("❌ Ошибка: pip install requests")
     exit(1)
 
 try:
@@ -20,453 +23,133 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
-    print("⚠️  Предупреждение: Модуль 'telethon' не найден. Сбор из Telegram будет отключен.")
-    print("   Установите: pip install telethon")
+    print("⚠️  Telethon не найден. Сбор из Telegram будет пропущен.")
 
 # ═══════════════════════════════════════════════════════════
-# НАСТРОЙКИ (Безопасное хранение)
+# 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
-# Рекомендуется задать эти переменные в среде ОС перед запуском:
-# export TELEGRAM_API_ID=12345
-# export TELEGRAM_API_HASH="your_hash"
-# export TELEGRAM_PHONE="+79001234567"
 
 TELEGRAM_API_ID   = os.environ.get("TELEGRAM_API_ID", "")
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_PHONE    = os.environ.get("TELEGRAM_PHONE", "")
 
-TELEGRAM_CHANNELS = [
-    "napsternetv",
-    "config_proxy",
-    "v2rayngvpn",
-    "vpnplusee_free",
-    "v2Line",
-    "V2rayNGX",
-]
-TELEGRAM_POSTS_LIMIT = 50  # Ограничено для скорости
+TELEGRAM_CHANNELS = ["napsternetv", "config_proxy", "v2rayngvpn", "vpnplusee_free", "v2Line", "V2rayNGX"]
+TELEGRAM_POSTS_LIMIT = 100
 
 # ═══════════════════════════════════════════════════════════
-# GEO / IP
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ═══════════════════════════════════════════════════════════
+
 def get_country_by_ip(ip):
-    """Определяет страну по IP адресу"""
     try:
-        response = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get('status') != 'fail':
-                return data.get('countryCode', 'XX')
-    except Exception:
-        pass
-    return "XX"
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=countryCode", timeout=3)
+        return r.json().get('countryCode', 'XX')
+    except: return "XX"
 
-# ═══════════════════════════════════════════════════════════
-# TELEGRAM — сбор ссылок
-# ═══════════════════════════════════════════════════════════
-def fetch_telegram_configs():
-    if not TELETHON_AVAILABLE:
-        return ""
-    
-    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH or not TELEGRAM_PHONE:
-        print("⚠️  Telegram credentials не заданы. Пропускаем сбор из Telegram.")
-        print("   Заполните переменные окружения TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_PHONE")
-        return ""
-
-    all_text = ""
-    session_file = "tg_session"
-
-    try:
-        # Очищаем номер от пробелов
-        phone_clean = TELEGRAM_PHONE.replace(" ", "")
-        
-        with TelegramClient(session_file, int(TELEGRAM_API_ID), TELEGRAM_API_HASH) as client:
-            if not client.is_user_authorized():
-                client.send_code_request(phone_clean)
-                code = input("Введите код из Telegram: ")
-                client.sign_in(phone_clean, code)
-
-            for channel in TELEGRAM_CHANNELS:
-                try:
-                    print(f"📨 Читаем канал: t.me/{channel}")
-                    messages = client.get_messages(channel, limit=TELEGRAM_POSTS_LIMIT)
-                    channel_text = ""
-                    for msg in messages:
-                        if msg.text:
-                            channel_text += msg.text + "\n"
-                        if msg.reply_markup:
-                            try:
-                                for row in msg.reply_markup.rows:
-                                    for btn in row.buttons:
-                                        if hasattr(btn, 'url') and btn.url:
-                                            channel_text += btn.url + "\n"
-                            except Exception:
-                                pass
-
-                    found = len(extract_links(channel_text))
-                    print(f"   ✅ Получено постов: {len(messages)}, найдено ссылок: {found}")
-                    all_text += channel_text + "\n"
-
-                except errors.ChannelPrivateError:
-                    print(f"   ❌ Канал {channel} закрытый")
-                except Exception as e:
-                    print(f"   ❌ Ошибка при чтении {channel}: {e}")
-    except Exception as e:
-        print(f"❌ Ошибка Telegram клиента: {e}")
-
-    return all_text
-
-# ═══════════════════════════════════════════════════════════
-# REMOTE HTTP SOURCES
-# ═══════════════════════════════════════════════════════════
-def fetch_remote_configs(url):
-    try:
-        # Убираем пробелы из URL на всякий случай
-        url = url.strip()
-        print(f"Загрузка конфигов из: {url}")
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            content = response.text.strip()
-            try:
-                # Попытка декодирования Base64
-                missing_padding = len(content) % 4
-                if missing_padding:
-                    content += '=' * (4 - missing_padding)
-                decoded = base64.b64decode(content).decode('utf-8')
-                return decoded
-            except Exception:
-                return response.text
-        else:
-            print(f"❌ Ошибка загрузки {url}: HTTP {response.status_code}")
-    except Exception as e:
-        print(f"❌ Ошибка при загрузке {url}: {e}")
-    return ""
-
-# ═══════════════════════════════════════════════════════════
-# EXTRACT LINKS
-# ═══════════════════════════════════════════════════════════
 def extract_links(content):
-    protocols = [
-        'vmess', 'trojan', 'vless',
-        'ss', 'shadowsocks',
-        'wireguard', 'wg',
-        'hysteria', 'hysteria2', 'hy2',
-        'tuic', 'anytls', 'ssh',
-        'socks', 'socks4', 'socks5',
-        'http', 'https',
-    ]
+    protocols = ['vmess', 'trojan', 'vless', 'ss', 'shadowsocks', 'wireguard', 'hysteria', 'hy2', 'tuic']
     pattern = r'(?:' + '|'.join(protocols) + r')://[^\s<>"\`]+'
-    links = re.findall(pattern, content, re.IGNORECASE)
-    
-    # JSON-конфиги (custom)
-    json_pattern = r'\{[^}]*"protocol"\s*:\s*"[^"]*"[^}]*\}'
-    json_configs = re.findall(json_pattern, content)
+    return re.findall(pattern, content, re.IGNORECASE)
 
-    return links + json_configs
-
-# ═══════════════════════════════════════════════════════════
-# FILE HELPERS
-# ═══════════════════════════════════════════════════════════
-def read_existing_links(filename):
-    if not os.path.exists(filename):
-        return []
-    with open(filename, 'r', encoding='utf-8') as f:
-        return [line.strip() for line in f if line.strip()]
-
-def save_links(filename, links, mode='w'):
-    with open(filename, mode, encoding='utf-8') as f:
-        f.write('\n'.join(links) + '\n' if links else '')
-
-# ═══════════════════════════════════════════════════════════
-# PARSERS
-# ═══════════════════════════════════════════════════════════
 def parse_vmess(link):
     try:
         b64_str = link[8:]
         b64_str += '=' * (-len(b64_str) % 4)
-        decoded = base64.b64decode(b64_str).decode('utf-8')
-        config = json.loads(decoded)
-        return config.get('add'), config.get('port'), config
-    except:
-        return None, None, None
+        config = json.loads(base64.b64decode(b64_str).decode('utf-8'))
+        return config.get('add'), config.get('port')
+    except: return None, None
 
-def parse_vless(link):
+def parse_generic(link):
     try:
         parsed = urlparse(link)
-        host = parsed.hostname
-        port = parsed.port or 443
-        return host, port, parsed
-    except:
-        return None, None, None
+        return parsed.hostname, parsed.port or 443
+    except: return None, None
 
-def parse_tuic(link):
-    try:
-        parsed = urlparse(link)
-        host = parsed.hostname
-        port = parsed.port or 443
-        return host, port, parsed
-    except:
-        return None, None, None
-
-def parse_shadowsocks(link):
-    try:
-        content = link[14:] if link.startswith('shadowsocks://') else link[5:]
-        if '@' in content:
-            config_part = content.split('#')[0] if '#' in content else content
-            _, server_part = config_part.split('@', 1)
-            host, port = server_part.rsplit(':', 1)
-            return host, int(port), content
-        else:
-            b64_part = content.split('#')[0] if '#' in content else content
-            b64_part += '=' * (-len(b64_part) % 4)
-            decoded = base64.b64decode(b64_part).decode('utf-8')
-            if '@' in decoded:
-                _, server_part = decoded.split('@', 1)
-                host, port = server_part.rsplit(':', 1)
-                return host, int(port), decoded
-    except Exception:
-        return None, None, None
-
-def parse_wireguard(link):
-    try:
-        parsed = urlparse(link)
-        if parsed.netloc:
-            host_port = parsed.netloc.split(':')
-            host = host_port[0]
-            port = int(host_port[1]) if len(host_port) > 1 else 51820
-            return host, port, parsed
-        query_params = parse_qs(parsed.query)
-        if 'endpoint' in query_params:
-            endpoint = query_params['endpoint'][0]
-            if ':' in endpoint:
-                host, port = endpoint.rsplit(':', 1)
-                return host, int(port), parsed
-    except Exception:
-        return None, None, None
-
-def parse_hysteria(link):
-    try:
-        parsed = urlparse(link)
-        if parsed.hostname:
-            return parsed.hostname, parsed.port or 443, parsed
-        content = link.split('://', 1)[1]
-        host_part = content.split('@', 1)[-1]
-        host_part = host_part.split('?')[0].split('#')[0]
-        if ':' in host_part:
-            host, port = host_part.rsplit(':', 1)
-            return host, int(port), parsed
-    except Exception:
-        return None, None, None
-
-def parse_socks(link):
-    try:
-        parsed = urlparse(link)
-        return parsed.hostname, parsed.port or 1080, parsed
-    except:
-        return None, None, None
-
-def parse_ssh(link):
-    try:
-        parsed = urlparse(link)
-        return parsed.hostname, parsed.port or 22, parsed
-    except:
-        return None, None, None
-
-def parse_http_proxy(link):
-    try:
-        parsed = urlparse(link)
-        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-        return parsed.hostname, port, parsed
-    except:
-        return None, None, None
-
-def parse_generic_url(link):
-    try:
-        parsed = urlparse(link)
-        default_ports = {'trojan': 443, 'vless': 443, 'tuic': 443, 'anytls': 443}
-        port = parsed.port or default_ports.get(parsed.scheme.lower(), 443)
-        return parsed.hostname, port, parsed
-    except:
-        return None, None, None
-
-# ═══════════════════════════════════════════════════════════
-# LINK MODIFIER
-# ═══════════════════════════════════════════════════════════
-def modify_link_with_country(link, country_code):
-    if link.strip().startswith('{'):
-        return link
-    protocol = link.split('://')[0].lower()
-
-    try:
-        if protocol == 'vmess':
-            b64_str = link[8:] + '=' * (-len(link[8:]) % 4)
-            config = json.loads(base64.b64decode(b64_str).decode('utf-8'))
-            ps = config.get('ps', '')
-            if not ps.startswith(f"[{country_code}]"):
-                config['ps'] = f"[{country_code}] {ps}".strip()
-            new_b64 = base64.b64encode(json.dumps(config, ensure_ascii=False).encode()).decode()
-            return f"vmess://{new_b64}"
-
-        elif protocol in ['trojan', 'vless', 'ss', 'shadowsocks',
-                          'hysteria', 'hysteria2', 'hy2', 'tuic', 'anytls',
-                          'ssh', 'socks', 'socks4', 'socks5', 'http', 'https']:
-            if '#' in link:
-                base_link, name = link.rsplit('#', 1)
-                name = unquote(name)
-                if not name.startswith(f"[{country_code}]"):
-                    name = f"[{country_code}] {name}".strip()
-                return f"{base_link}#{quote(name)}"
-            else:
-                return f"{link}#{quote(f'[{country_code}] Server')}"
-
-        elif protocol in ['wireguard', 'wg']:
-            if '#' in link:
-                base_link, frag = link.rsplit('#', 1)
-                frag = unquote(frag)
-                if not frag.startswith(f"[{country_code}]"):
-                    frag = f"[{country_code}] {frag}".strip()
-                return f"{base_link}#{quote(frag)}"
-            return f"{link}#{quote(f'[{country_code}] WireGuard')}"
-
-    except Exception as e:
-        print(f"Ошибка при модификации ссылки: {e}")
-
-    return link
-
-# ═══════════════════════════════════════════════════════════
-# CONNECTION CHECK
-# ═══════════════════════════════════════════════════════════
-def check_tcp_connection_speed(host, port, timeout=5, test_size=512):
-    try:
-        port = int(port)
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(timeout)
-            t0 = time.time()
-            result = s.connect_ex((host, port))
-            connect_time = (time.time() - t0) * 1000
-            if result == 0:
-                try:
-                    t1 = time.time()
-                    s.send(b'A' * test_size)
-                    send_time = (time.time() - t1) * 1000
-                    speed = (test_size * 8) / (send_time / 1000) / 1024 if send_time > 0 else 0
-                    return True, connect_time, speed
-                except:
-                    return True, connect_time, 0
-            return False, connect_time, 0
-    except:
-        return False, float('inf'), 0
-
-def check_connection_with_speed(host, port, timeout=10):
-    if not host or not port:
-        return False, {}
-    try:
-        ok, ct, speed = check_tcp_connection_speed(host, port, timeout // 2)
-        if ok:
-            quality = ('excellent' if ct < 100 else
-                       'good'      if ct < 300 else
-                       'average'   if ct < 500 else 'poor')
-            metrics = {
-                'connect_time_ms': round(ct, 2),
-                'speed_kbps': round(speed, 2),
-                'connection_quality': quality,
-            }
-            if port in [80, 443, 8080, 8443]:
-                try:
-                    proto = 'https' if port in [443, 8443] else 'http'
-                    t0 = time.time()
-                    r = requests.head(f"{proto}://{host}:{port}", timeout=timeout // 3, verify=False)
-                    metrics['http_response_time_ms'] = round((time.time() - t0) * 1000, 2)
-                    metrics['http_status'] = r.status_code
-                except:
-                    pass
-            return True, metrics
-        return False, {'connect_time_ms': ct, 'error': 'connection_failed'}
-    except Exception as e:
-        return False, {'error': str(e)}
-
-def resolve_hostname(hostname):
-    try:
-        return socket.gethostbyname(hostname)
-    except:
-        return None
-
-# ═══════════════════════════════════════════════════════════
-# LINK CHECKER (thread worker)
-# ═══════════════════════════════════════════════════════════
 PARSERS = {
-    'vmess':       parse_vmess,
-    'vless':       parse_vless,
-    'ss':          parse_shadowsocks,
-    'shadowsocks': parse_shadowsocks,
-    'wireguard':   parse_wireguard,
-    'wg':          parse_wireguard,
-    'hysteria':    parse_hysteria,
-    'hysteria2':   parse_hysteria,
-    'hy2':         parse_hysteria,
-    'tuic':        parse_tuic,
-    'ssh':         parse_ssh,
-    'socks':       parse_socks,
-    'socks4':      parse_socks,
-    'socks5':      parse_socks,
-    'http':        parse_http_proxy,
-    'https':       parse_http_proxy,
-    'trojan':      parse_generic_url,
-    'anytls':      parse_generic_url,
+    'vmess': parse_vmess,
+    'vless': parse_generic,
+    'trojan': parse_generic,
+    'ss': parse_generic,
+    'shadowsocks': parse_generic,
+    'hysteria2': parse_generic,
+    'hy2': parse_generic,
 }
 
-def check_link_wrapper(link):
-    if link.strip().startswith('{'):
-        return None
+def deep_check(host, port, protocol, timeout=4):
+    try:
+        port = int(port)
+        sock = socket.create_connection((host, port), timeout=timeout)
+        tls_protocols = ['vless', 'vmess', 'trojan', 'https', 'anytls', 'hysteria', 'hy2']
+        if any(p in protocol.lower() for p in tls_protocols):
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            try:
+                with context.wrap_socket(sock, server_hostname=host) as ssock:
+                    ssock.settimeout(timeout)
+                    return True
+            except: return False
+        sock.close()
+        return True
+    except: return False
+
+def modify_link_with_country(link, country_code):
+    try:
+        if '#' in link:
+            base, name = link.rsplit('#', 1)
+            return f"{base}#{quote(f'[{country_code}] {unquote(name)}')}"
+        return f"{link}#{quote(f'[{country_code}] Node')}"
+    except: return link
+
+def fetch_remote_configs(url):
+    try:
+        r = requests.get(url.strip(), timeout=10)
+        if r.status_code == 200:
+            text = r.text
+            if len(text) > 20 and not any(p in text for p in ['://', 'proxies:']):
+                try:
+                    text += '=' * (-len(text) % 4)
+                    return base64.b64decode(text).decode('utf-8')
+                except: pass
+            return text
+    except: return ""
+    return ""
+
+def check_link_worker(link):
     protocol = link.split('://')[0].lower()
-    parser = PARSERS.get(protocol)
-    if not parser:
-        return None
+    parser = PARSERS.get(protocol, parse_generic)
+    host, port = parser(link)
+    if host and port:
+        if deep_check(host, port, protocol):
+            try:
+                ip = socket.gethostbyname(host) if not re.match(r'\d+\.\d+', host) else host
+                cc = get_country_by_ip(ip)
+                return modify_link_with_country(link, cc)
+            except: return modify_link_with_country(link, "XX")
+    return None
 
-    host, port, _ = parser(link)
-    if not host or not port:
-        return None
-
-    is_working, metrics = check_connection_with_speed(host, port)
-
-    if is_working:
-        ip = resolve_hostname(host) or host
-        country_code = get_country_by_ip(ip) if ip else "XX"
-        time.sleep(0.1)
-
-        modified = modify_link_with_country(link, country_code)
-        speed_s   = f" | Speed: {metrics.get('speed_kbps', 0):.1f} KB/s"
-        connect_s = f" | Connect: {metrics.get('connect_time_ms', 0):.1f}ms"
-        quality_s = f" | Quality: {metrics.get('connection_quality', 'unknown')}"
-        print(f"✅ [{country_code}] {protocol}://{host}:{port}{connect_s}{speed_s}{quality_s}")
-        return modified
-    else:
-        err = f" | {metrics.get('error', '')}" if metrics.get('error') else ""
-        print(f"❌ {protocol}://{host}:{port}{err}")
-        return None
+def fetch_telegram_configs():
+    if not (TELETHON_AVAILABLE and TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_PHONE):
+        return ""
+    all_text = ""
+    try:
+        with TelegramClient('session_name', int(TELEGRAM_API_ID), TELEGRAM_API_HASH) as client:
+            for channel in TELEGRAM_CHANNELS:
+                print(f"📨 Читаем Telegram: {channel}")
+                for msg in client.iter_messages(channel, limit=TELEGRAM_POSTS_LIMIT):
+                    if msg.text: all_text += msg.text + "\n"
+    except Exception as e: print(f"❌ Ошибка Telegram: {e}")
+    return all_text
 
 # ═══════════════════════════════════════════════════════════
-# MAIN
+# 3. ОСНОВНОЙ ЦИКЛ
 # ═══════════════════════════════════════════════════════════
+
 def main():
-    # Используем текущую директорию скрипта
-    base_dir = os.getcwd()
-    input_file = os.path.join(base_dir, 'configs.txt')
-    all_file   = os.path.join(base_dir, 'config_all.txt')
-    good_file  = os.path.join(base_dir, 'config_good_all.txt')
-    
-    print("=" * 60)
-    print("Начинаем обработку ссылок...")
-    print("=" * 60)
-
-    # ── 1. Локальный файл ──────────────────────────────────
+    start_time = time.time()
     all_content = ""
-    if os.path.exists(input_file):
-        print(f"\nЧтение локального файла: {input_file}")
-        with open(input_file, 'r', encoding='utf-8') as f:
-            all_content += f.read() + "\n"
-
-    # ── 2. Удалённые HTTP источники ────────────────────────
-    # Все ссылки исправлены (убраны пробелы)
+    
+    # Список источников
     remote_sources = [
         'https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_base64_Sub.txt',
         'https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt',
@@ -523,83 +206,165 @@ def main():
         'https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_BASE64.txt',
         'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list_raw.txt',
         'https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list_base64.txt',
+        'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/all_extracted_configs.txt',
+        'https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt',
+        'https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/1.txt',
+        'https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/4.txt',
+        'https://raw.githubusercontent.com/STR97/STRUGOV/refs/heads/main/STR.BYPASS',
+        'https://raw.githubusercontent.com/Danialsamadi/v2go/refs/heads/main/AllConfigsSub.txt',
+        'https://raw.githubusercontent.com/Firmfox/Proxify/refs/heads/main/v2ray_configs/mixed/subscription-1.txt',
+        'https://raw.githubusercontent.com/Firmfox/Proxify/refs/heads/main/v2ray_configs/mixed/subscription-2.txt',
+        'https://raw.githubusercontent.com/Firmfox/Proxify/refs/heads/main/v2ray_configs/seperated_by_protocol/shadowsocks.txt',
+        'https://raw.githubusercontent.com/LalatinaHub/Mineral/refs/heads/master/result/nodes',
+        'https://raw.githubusercontent.com/Farid-Karimi/Config-Collector/refs/heads/main/mixed_iran.txt',
+        'https://raw.githubusercontent.com/nscl5/4/refs/heads/main/Splitted-By-Protocol/ss.txt',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/refs/heads/main/subscriptions/v2ray/super-sub.txt',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/refs/heads/main/subscriptions/v2ray/all_sub.txt',
+        'https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/base64/xhttp',
+        'https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/nekobox/mix.json',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/subs/sub1.txt',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/ss.txt',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt',
+        'https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vmess.txt',
+        'https://robin.victoriacross.ir',
+        'https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/SSTime',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/ss.txt',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vmess.txt',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vless.txt',
+        'https://v2.alicivil.workers.dev',
+        'https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/Eternity',
+        'https://raw.githubusercontent.com/mahdibland/ShadowsocksAggregator/master/sub/splitted/trojan.txt',
+        'https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/refs/heads/main/Best-Results/proxies.txt',
+        'https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/main/splitted-by-protocol/vless.txt',
+        'https://raw.githubusercontent.com/F0rc3Run/F0rc3Run/main/splitted-by-protocol/shadowsocks.txt',
+        'https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/mixed',
+        'https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/python/hysteria2',
+        'https://raw.githubusercontent.com/Pawdroid/Free-servers/main/static/sub_en',
+        'https://raw.githubusercontent.com/mohamadfg-dev/telegram-v2ray-configs-collector/refs/heads/main/category/httpupgrade.txt',
+        'https://raw.githubusercontent.com/mohamadfg-dev/telegram-v2ray-configs-collector/refs/heads/main/category/xhttp.txt',
+        'https://shadowmere.xyz/api/b64sub',
+        'https://openproxylist.com/v2ray/',
+        'https://raw.githubusercontent.com/NiREvil/vless/refs/heads/main/sub/fragment',
+        'https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/ss.txt',
+        'https://raw.githubusercontent.com/arshiacomplus/v2rayExtractor/refs/heads/main/mix/sub.html',
+        'https://raw.githubusercontent.com/arshiacomplus/v2rayExtractor/refs/heads/main/vless.html',
+        'https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vmess.txt',
+        'https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/refs/heads/main/Protocols/vless.txt',
+        'https://raw.githubusercontent.com/Mahdi0024/ProxyCollector/master/sub/proxies.txt',
+        'https://raw.githubusercontent.com/10ium/free-config/refs/heads/main/HighSpeed.txt',
+        'https://github.com/4n0nymou3/multi-proxy-config-fetcher/raw/refs/heads/main/configs/proxy_configs.txt',
+        'https://sub.amiralter.com/config-lite',
+        'https://sub.amiralter.com/config',
+        'https://raw.githubusercontent.com/DarknessShade/Sub/main/V2mix',
+        'https://raw.githubusercontent.com/DarknessShade/Sub/main/Ss',
+        'https://raw.githubusercontent.com/nscl5/5/refs/heads/main/configs/vmess.txt',
+        'https://raw.githubusercontent.com/nscl5/5/refs/heads/main/configs/all.txt',
+        'https://raw.githubusercontent.com/itsyebekhe/PSG/main/lite/subscriptions/xray/normal/hy2',
+        'https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/normal/vmess',
+        'https://raw.githubusercontent.com/lagzian/IranConfigCollector/main/Base64.txt',
+        'https://raw.githubusercontent.com/lagzian/SS-Collector/refs/heads/main/SS/TrinityBase',
+        'https://raw.githubusercontent.com/MahsaNetConfigTopic/config/refs/heads/main/xray_final.txt',
+        'https://raw.githubusercontent.com/hamedcode/port-based-v2ray-configs/main/sub/vless.txt',
+        'https://raw.githubusercontent.com/hamedcode/port-based-v2ray-configs/main/sub/vmess.txt',
+        'https://raw.githubusercontent.com/hamedcode/port-based-v2ray-configs/main/sub/ss.txt',
+        'https://raw.githubusercontent.com/AzadNetCH/Clash/main/AzadNet.txt',
+        'https://raw.githubusercontent.com/Leon406/SubCrawler/refs/heads/main/sub/share/a11',
+        'https://raw.githubusercontent.com/imalrzai/ExclaveVirtual/refs/heads/main/ExclaveVirtual',
+        'https://raw.githubusercontent.com/youfoundamin/V2rayCollector/main/mixed_iran.txt',
+        'https://raw.githubusercontent.com/youfoundamin/V2rayCollector/main/ss_iran.txt',
+        'https://raw.githubusercontent.com/youfoundamin/V2rayCollector/main/vless_iran.txt',
+        'https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/ss',
+        'https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/trojan',
+        'https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless',
+        'https://raw.githubusercontent.com/HosseinKoofi/GO_V2rayCollector/main/mixed_iran.txt',
+        'https://raw.githubusercontent.com/HosseinKoofi/GO_V2rayCollector/main/vless_iran.txt',
+        'https://raw.githubusercontent.com/HosseinKoofi/GO_V2rayCollector/main/ss_iran.txt',
+        'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/ss_configs.txt',
+        'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt',
+        'https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/vmess_configs.txt',
+        'https://raw.githubusercontent.com/Argh94/V2RayAutoConfig/refs/heads/main/configs/Vmess.txt',
+        'https://raw.githubusercontent.com/Argh94/V2RayAutoConfig/refs/heads/main/configs/Hysteria2.txt',
+        'https://raw.githubusercontent.com/Argh94/V2RayAutoConfig/refs/heads/main/configs/Germany.txt',
+        'https://raw.githubusercontent.com/Stinsonysm/GO_V2rayCollector/refs/heads/main/trojan_iran.txt',
+        'https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector_Py/refs/heads/main/sub/Mix/mix.txt',
+        'https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector_Py/refs/heads/main/sub/United%20States/config.txt',
+        'https://raw.githubusercontent.com/liketolivefree/kobabi/main/sub.txt',
+        'https://raw.githubusercontent.com/liketolivefree/kobabi/main/sub_all.txt',
+        'https://raw.githubusercontent.com/10ium/ScrapeAndCategorize/refs/heads/main/output_configs/Hysteria2.txt',
+        'https://raw.githubusercontent.com/10ium/V2ray-Config/main/Splitted-By-Protocol/hysteria2.txt',
+        'https://raw.githubusercontent.com/10ium/V2Hub3/main/merged_base64',
+        'https://raw.githubusercontent.com/10ium/V2Hub3/refs/heads/main/Split/Normal/shadowsocks',
+        'https://raw.githubusercontent.com/10ium/V2Hub3/refs/heads/main/Split/Normal/reality',
+        'https://raw.githubusercontent.com/10ium/base64-encoder/main/encoded/10ium_mixed_iran.txt',
+        'https://raw.githubusercontent.com/10ium/ScrapeAndCategorize/refs/heads/main/output_configs/Vless.txt',
+        'https://raw.githubusercontent.com/10ium/ScrapeAndCategorize/refs/heads/main/output_configs/ShadowSocks.txt',
+        'https://raw.githubusercontent.com/10ium/ScrapeAndCategorize/refs/heads/main/output_configs/Trojan.txt',
+        'https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub1.txt',
+        'https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub2.txt',
+        'https://raw.githubusercontent.com/Epodonios/v2ray-configs/refs/heads/main/Sub3.txt',
+        'https://raw.githubusercontent.com/aqayerez/MatnOfficial-VPN/refs/heads/main/MatnOfficial',
+        'https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/V2RAY_SUB/refs/heads/main/v2ray_configs.txt',
+        'https://raw.githubusercontent.com/bamdad23/JavidnamanIran/refs/heads/main/WS%2BHysteria2',
+        'https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/telegram/popular_channels_1',
+        'https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/telegram/popular_channels_2',
+        'https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/subs/hysteria',
+        'https://raw.githubusercontent.com/mshojaei77/v2rayAuto/refs/heads/main/subs/hy2',
+        'https://raw.githubusercontent.com/ndsphonemy/proxy-sub/refs/heads/main/speed.txt',
+        'https://raw.githubusercontent.com/ndsphonemy/proxy-sub/refs/heads/main/hys-tuic.txt',
+        'https://trojanvmess.pages.dev/cmcm?b64',
+        'https://raw.githubusercontent.com/Mosifree/-FREE2CONFIG/refs/heads/main/Reality',
+        'https://raw.githubusercontent.com/Mosifree/-FREE2CONFIG/refs/heads/main/Vless',
+        'https://raw.githubusercontent.com/AzadNetCH/Clash/refs/heads/main/AzadNet_iOS.txt',
+        'https://raw.githubusercontent.com/Proxydaemitelegram/Proxydaemi44/refs/heads/main/Proxydaemi44',
+        'https://raw.githubusercontent.com/MrMohebi/xray-proxy-grabber-telegram/refs/heads/master/collected-proxies/xray-json-full/actives_all.json',
+        'https://raw.githubusercontent.com/Created-By/Telegram-Eag1e_YT/refs/heads/main/%40Eag1e_YT',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub6.txt',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub7.txt',
+        'https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub8.txt',
+        'https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub9.txt',
+        'https://azadnet05.pages.dev/sub/4d794980-54c0-4fcb-8def-c2beaecadbad',
+        'https://raw.githubusercontent.com/rango-cfs/NewCollector/refs/heads/main/v2ray_links.txt'
     ]
     
+    # 1. Сбор ссылок
+    print("🌐 Загрузка HTTP источников...")
     for url in remote_sources:
-        content = fetch_remote_configs(url)
-        if content:
-            all_content += content + "\n"
-            
-    # ── 3. Telegram каналы ─────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Сбор ссылок из Telegram каналов...")
-    print("=" * 60)
-    tg_content = fetch_telegram_configs()
-    if tg_content:
-        all_content += tg_content + "\n"
-        print(f"📨 Telegram: найдено {len(extract_links(tg_content))} ссылок")
+        all_content += fetch_remote_configs(url) + "\n"
+    
+    all_content += fetch_telegram_configs()
+    
+    # 2. Очистка и дедупликация
+    print("🧹 Дедупликация...")
+    raw_links = extract_links(all_content)
+    unique_links = list(dict.fromkeys([l.strip() for l in raw_links]))
+    
+    with open('config_all.txt', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(unique_links))
+        
+    # 3. Проверка
+    print(f"🚀 Проверка {len(unique_links)} уникальных ссылок (Deep Check)...")
+    good_links = []
+    with ThreadPoolExecutor(max_workers=30) as executor:
+        futures = {executor.submit(check_link_worker, lnk): lnk for lnk in unique_links}
+        for i, future in enumerate(as_completed(futures)):
+            res = future.result()
+            if res: good_links.append(res)
+            if i % 20 == 0: print(f"📈 Прогресс: {i}/{len(unique_links)} | Рабочих: {len(good_links)}")
 
-    # ── 4. Извлечение и дедупликация ──────────────────────
-    new_links       = extract_links(all_content)
-    existing_links  = read_existing_links(all_file)
-    unique_links    = list(dict.fromkeys(existing_links + new_links))
+    # 4. Сохранение
+    with open('config_good_all.txt', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(good_links))
+    
+    print(f"💾 Завершено. Найдено рабочих: {len(good_links)}")
 
-    print(f"\n📊 Новых ссылок из всех источников: {len(new_links)}")
-    print(f"📊 Существующих ссылок: {len(existing_links)}")
-    print(f"📊 Уникальных ссылок всего: {len(unique_links)}")
+    # 5. Git Push
+    if os.path.exists('.git'):
+        print("↗️ Отправка в GitHub...")
+        os.system('git add config_all.txt config_good_all.txt')
+        os.system('git commit -m "Auto-update: ' + time.strftime("%Y-%m-%d %H:%M") + '"')
+        os.system('git push')
 
-    save_links(all_file, unique_links)
-    print(f"💾 Сохранено в {all_file}")
-
-    # ── 5. Проверка ────────────────────────────────────────
-    save_links(good_file, [], mode='w')
-    print(f"🔄 Файл {good_file} обнулен\n")
-    print("=" * 60)
-    print("Проверяем ссылки...")
-    print("=" * 60 + "\n")
-
-    good_links   = []
-    max_workers  = min(10, len(unique_links)) if unique_links else 1
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_link_wrapper, lnk): lnk for lnk in unique_links}
-        completed = 0
-        for future in as_completed(futures):
-            completed += 1
-            result = future.result()
-            if result:
-                good_links.append(result)
-            if completed % 10 == 0 or completed == len(unique_links):
-                print(f"\n📈 {completed}/{len(unique_links)} проверено, рабочих: {len(good_links)}\n")
-
-    print("\n" + "=" * 60)
-    print(f"✅ Всего проверено: {len(unique_links)}")
-    print(f"✅ Рабочих ссылок: {len(good_links)}")
-    if unique_links:
-        print(f"📊 Успешных: {len(good_links)/len(unique_links)*100:.1f}%")
-    print("=" * 60)
-
-    save_links(good_file, good_links)
-    print(f"\n💾 Рабочие ссылки → {good_file}")
-
-    # ── 6. Git (Опционально) ───────────────────────────────
-    # Закомментировано, чтобы не вызывать ошибок при отсутствии git
-    # print("\n" + "=" * 60)
-    # print("Git операции...")
-    # print("=" * 60)
-    # os.chdir(base_dir)
-    # os.system('git add config_all.txt config_good_all.txt')
-    # if os.system('git commit -m "Auto-update: country codes + Telegram + remote sources"') == 0:
-    #     if os.system('git push') == 0:
-    #         print("✅ Успешно отправлено в GitHub")
-    #     else:
-    #         print("❌ Ошибка git push")
-    # else:
-    #     print("ℹ️ Нет изменений для коммита")
-
-    print("\n" + "=" * 60)
-    print("Готово!")
-    print("=" * 60)
+    print(f"⏱ Время выполнения: {int(time.time() - start_time)} сек.")
 
 if __name__ == "__main__":
     main()

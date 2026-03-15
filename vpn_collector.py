@@ -5,10 +5,11 @@ import os
 import time
 import socket
 import ssl
+import sys
 from urllib.parse import urlparse, parse_qs, unquote, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Попытка импорта библиотек
+# Проверка зависимостей
 try:
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -23,21 +24,23 @@ try:
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
-    print("⚠️  Telethon не найден. Сбор из Telegram будет пропущен.")
 
 # ═══════════════════════════════════════════════════════════
-# 1. ГЛОБАЛЬНЫЕ НАСТРОЙКИ
+# 1. НАСТРОЙКИ (КАНАЛЫ И АККАУНТ)
 # ═══════════════════════════════════════════════════════════
 
 TELEGRAM_API_ID   = os.environ.get("TELEGRAM_API_ID", "")
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
 TELEGRAM_PHONE    = os.environ.get("TELEGRAM_PHONE", "")
 
-TELEGRAM_CHANNELS = ["napsternetv", "config_proxy", "v2rayngvpn", "vpnplusee_free", "v2Line", "V2rayNGX"]
+TELEGRAM_CHANNELS = [
+    "napsternetv", "config_proxy", "v2rayngvpn", "vpnplusee_free", 
+    "v2Line", "V2rayNGX", "VmessSub", "v2ray_outline_config"
+]
 TELEGRAM_POSTS_LIMIT = 100
 
 # ═══════════════════════════════════════════════════════════
-# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 2. ФУНКЦИИ СБОРА И ПРОВЕРКИ
 # ═══════════════════════════════════════════════════════════
 
 def get_country_by_ip(ip):
@@ -66,13 +69,8 @@ def parse_generic(link):
     except: return None, None
 
 PARSERS = {
-    'vmess': parse_vmess,
-    'vless': parse_generic,
-    'trojan': parse_generic,
-    'ss': parse_generic,
-    'shadowsocks': parse_generic,
-    'hysteria2': parse_generic,
-    'hy2': parse_generic,
+    'vmess': parse_vmess, 'vless': parse_generic, 'trojan': parse_generic,
+    'ss': parse_generic, 'shadowsocks': parse_generic, 'hysteria2': parse_generic, 'hy2': parse_generic,
 }
 
 def deep_check(host, port, protocol, timeout=4):
@@ -101,20 +99,6 @@ def modify_link_with_country(link, country_code):
         return f"{link}#{quote(f'[{country_code}] Node')}"
     except: return link
 
-def fetch_remote_configs(url):
-    try:
-        r = requests.get(url.strip(), timeout=10)
-        if r.status_code == 200:
-            text = r.text
-            if len(text) > 20 and not any(p in text for p in ['://', 'proxies:']):
-                try:
-                    text += '=' * (-len(text) % 4)
-                    return base64.b64decode(text).decode('utf-8')
-                except: pass
-            return text
-    except: return ""
-    return ""
-
 def check_link_worker(link):
     protocol = link.split('://')[0].lower()
     parser = PARSERS.get(protocol, parse_generic)
@@ -130,15 +114,20 @@ def check_link_worker(link):
 
 def fetch_telegram_configs():
     if not (TELETHON_AVAILABLE and TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_PHONE):
+        print("⚠️  Telegram данные не найдены. Пропуск.")
         return ""
     all_text = ""
+    print("\n📨 Начинаю сбор из Telegram...")
     try:
         with TelegramClient('session_name', int(TELEGRAM_API_ID), TELEGRAM_API_HASH) as client:
             for channel in TELEGRAM_CHANNELS:
-                print(f"📨 Читаем Telegram: {channel}")
+                sys.stdout.write(f"\r   Читаю канал: {channel}... ")
+                sys.stdout.flush()
                 for msg in client.iter_messages(channel, limit=TELEGRAM_POSTS_LIMIT):
                     if msg.text: all_text += msg.text + "\n"
-    except Exception as e: print(f"❌ Ошибка Telegram: {e}")
+        print("\n✅ Telegram загружен.")
+    except Exception as e:
+        print(f"\n❌ Ошибка Telegram: {e}")
     return all_text
 
 # ═══════════════════════════════════════════════════════════
@@ -149,7 +138,7 @@ def main():
     start_time = time.time()
     all_content = ""
     
-    # Список источников
+    # Вставьте сюда ваш полный список remote_sources (я оставил часть для примера)
     remote_sources = [
         'https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_base64_Sub.txt',
         'https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt',
@@ -325,46 +314,59 @@ def main():
         'https://azadnet05.pages.dev/sub/4d794980-54c0-4fcb-8def-c2beaecadbad',
         'https://raw.githubusercontent.com/rango-cfs/NewCollector/refs/heads/main/v2ray_links.txt'
     ]
-    
-    # 1. Сбор ссылок
-    print("🌐 Загрузка HTTP источников...")
-    for url in remote_sources:
-        all_content += fetch_remote_configs(url) + "\n"
-    
+
+    print(f"\n🚀 === СТАРТ СБОРА VPN ({time.strftime('%H:%M:%S')}) ===\n")
+
+    # 1. Загрузка HTTP
+    total_sources = len(remote_sources)
+    for idx, url in enumerate(remote_sources, 1):
+        domain = urlparse(url).netloc or "other"
+        sys.stdout.write(f"\r🌐 HTTP [{idx}/{total_sources}]: {domain[:30]}... ")
+        sys.stdout.flush()
+        try:
+            r = requests.get(url.strip(), timeout=10)
+            if r.status_code == 200:
+                all_content += r.text + "\n"
+        except: pass
+    print("\n✅ HTTP источники загружены.")
+
+    # 2. Загрузка Telegram
     all_content += fetch_telegram_configs()
-    
-    # 2. Очистка и дедупликация
-    print("🧹 Дедупликация...")
+
+    # 3. Дедупликация
+    print("\n🧹 Очистка дубликатов...")
     raw_links = extract_links(all_content)
     unique_links = list(dict.fromkeys([l.strip() for l in raw_links]))
-    
-    with open('config_all.txt', 'w', encoding='utf-8') as f:
-        f.write('\n'.join(unique_links))
-        
-    # 3. Проверка
-    print(f"🚀 Проверка {len(unique_links)} уникальных ссылок (Deep Check)...")
+    total_links = len(unique_links)
+    print(f"📊 Всего уникальных ссылок: {total_links}")
+
+    # 4. Проверка
+    print(f"\n🔍 Проверка в 30 потоков (Deep TLS Check)...")
     good_links = []
     with ThreadPoolExecutor(max_workers=30) as executor:
         futures = {executor.submit(check_link_worker, lnk): lnk for lnk in unique_links}
-        for i, future in enumerate(as_completed(futures)):
+        for i, future in enumerate(as_completed(futures), 1):
             res = future.result()
             if res: good_links.append(res)
-            if i % 20 == 0: print(f"📈 Прогресс: {i}/{len(unique_links)} | Рабочих: {len(good_links)}")
+            
+            percent = (i / total_links) * 100
+            sys.stdout.write(f"\r   [{i}/{total_links}] {percent:.1f}% | Рабочих: {len(good_links)} ")
+            sys.stdout.flush()
 
-    # 4. Сохранение
+    # 5. Сохранение и Git
+    print(f"\n\n💾 Сохранение...")
+    with open('config_all.txt', 'w', encoding='utf-8') as f:
+        f.write('\n'.join(unique_links))
     with open('config_good_all.txt', 'w', encoding='utf-8') as f:
         f.write('\n'.join(good_links))
-    
-    print(f"💾 Завершено. Найдено рабочих: {len(good_links)}")
 
-    # 5. Git Push
     if os.path.exists('.git'):
         print("↗️ Отправка в GitHub...")
-        os.system('git add config_all.txt config_good_all.txt')
-        os.system('git commit -m "Auto-update: ' + time.strftime("%Y-%m-%d %H:%M") + '"')
+        os.system('git add .')
+        os.system(f'git commit -m "Update nodes: {len(good_links)}"')
         os.system('git push')
 
-    print(f"⏱ Время выполнения: {int(time.time() - start_time)} сек.")
+    print(f"\n🏁 Готово за {int(time.time() - start_time)} сек. Рабочих: {len(good_links)}")
 
 if __name__ == "__main__":
     main()

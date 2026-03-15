@@ -354,19 +354,19 @@ def main():
             sys.stdout.flush()
 
     # 5. Сохранение и Git
-    print(f"\n\n💾 Сохранение...")
-    with open('config_all.txt', 'w', encoding='utf-8') as f:
-        f.write('\n'.join(unique_links))
-    with open('config_good_all.txt', 'w', encoding='utf-8') as f:
-        f.write('\n'.join(good_links))
-
-    if os.path.exists('.git'):
-        print("↗️ Отправка в GitHub...")
-        os.system('git add .')
-        os.system(f'git commit -m "Update nodes: {len(good_links)}"')
-        os.system('git push')
-
-    print(f"\n🏁 Готово за {int(time.time() - start_time)} сек. Рабочих: {len(good_links)}")
+    #print(f"\n\n💾 Сохранение...")
+    #with open('config_all.txt', 'w', encoding='utf-8') as f:
+    #    f.write('\n'.join(unique_links))
+    #with open('config_good_all.txt', 'w', encoding='utf-8') as f:
+    #    f.write('\n'.join(good_links))
+#
+    #if os.path.exists('.git'):
+    #    print("↗️ Отправка в GitHub...")
+    #    os.system('git add .')
+    #    os.system(f'git commit -m "Update nodes: {len(good_links)}"')
+    #    os.system('git push')
+#
+    #print(f"\n🏁 Готово за {int(time.time() - start_time)} сек. Рабочих: {len(good_links)}")
 
 if __name__ == "__main__":
     main()
